@@ -45,9 +45,9 @@ def load_custom_modules() -> None:
             spec = importlib.util.spec_from_file_location(f"dango_custom_{py.stem}", py)
             module = importlib.util.module_from_spec(spec)
             spec.loader.exec_module(module)
-            print(f"🧩 [custom] loaded {py.name}")
+            print(f"[custom] loaded {py.name}")
         except Exception as e:
-            print(f"⚠️  [custom] failed to load {py.name}: {e}")
+            print(f"[custom] failed to load {py.name}: {e}")
 
 
 # ── Shared signature handling ────────────────────────────────────────────────
