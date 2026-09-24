@@ -35,6 +35,90 @@ class TestCallDiscordAgent:
         assert asyncio.iscoroutinefunction(call_discord_agent)
 
 
+class TestGenshinWiki:
+    def test_wiki_url_uses_api_reader(self, monkeypatch):
+        import json
+
+        import dango.steps.call_agent as call_agent
+
+        monkeypatch.setattr(
+            call_agent,
+            "_get_genshin_wiki_articles",
+            lambda titles: [{"title": titles[0], "text": "Profile text"}],
+        )
+
+        result = json.loads(
+            call_agent._read_genshin_wiki_url(
+                "https://genshin-impact.fandom.com/wiki/Columbina/Profile"
+            )
+        )
+
+        assert result == {
+            "articles": [{"title": "Columbina/Profile", "text": "Profile text"}]
+        }
+
+    def test_wiki_url_decodes_article_title(self, monkeypatch):
+        import json
+
+        import dango.steps.call_agent as call_agent
+
+        monkeypatch.setattr(
+            call_agent,
+            "_get_genshin_wiki_articles",
+            lambda titles: [{"title": titles[0], "text": "Character text"}],
+        )
+
+        result = json.loads(
+            call_agent._read_genshin_wiki_url(
+                "https://genshin-impact.fandom.com/wiki/Columbina_Hyposelenia"
+            )
+        )
+
+        assert result["articles"][0]["title"] == "Columbina Hyposelenia"
+
+    def test_non_wiki_url_is_not_intercepted(self):
+        from dango.steps.call_agent import _read_genshin_wiki_url
+
+        assert _read_genshin_wiki_url("https://example.com/wiki/Columbina") is None
+
+    def test_grounding_policy_is_appended_last(self, monkeypatch):
+        import dango.steps.call_agent as call_agent
+
+        monkeypatch.setattr(call_agent, "ENABLE_CONTEXTUAL_SYSTEM_PROMPT", False)
+
+        result = call_agent._dynamic_instructions({"chat_sys_prompt": "Base prompt"})
+
+        assert result.startswith("Base prompt")
+        assert result.endswith(call_agent._GENSHIN_GROUNDING_POLICY)
+        assert "Never include citations, URLs, links" in result
+
+    def test_search_results_contain_no_links(self, monkeypatch):
+        import json
+
+        import dango.steps.call_agent as call_agent
+
+        class Response:
+            def raise_for_status(self):
+                return None
+
+            def json(self):
+                return {"query": {"search": [{"title": "Columbina"}]}}
+
+        monkeypatch.setattr("requests.get", lambda *args, **kwargs: Response())
+        monkeypatch.setattr(
+            call_agent,
+            "_get_genshin_wiki_articles",
+            lambda titles: [{"title": titles[0], "text": "Character text"}],
+        )
+
+        result = json.loads(call_agent._search_genshin_wiki("Columbina"))
+
+        assert result["articles"] == [
+            {"title": "Columbina", "text": "Character text"}
+        ]
+        assert "http" not in json.dumps(result)
+
+
 class TestExtractAndRenderTables:
     """Tests for extract_and_render_tables step."""
 
