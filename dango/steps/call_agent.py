@@ -807,46 +807,44 @@ async def _arun_agent(agent: Agent, messages: list, session_state: dict):
     return response
 
 
-def _trim_to_token_budget(messages: list[Message], budget: int) -> list[Message]:
-    """Trim oldest messages until estimated token count fits within budget.
-
-    Uses agno's tiktoken-based counter — local, no API calls, works with all providers.
-    The model_id is passed to tiktoken for encoding selection; unknown models fall back
-    to o200k_base which is a reasonable general-purpose estimate.
-    Falls back gracefully (no trimming) if token counting itself fails.
-    """
+def _trim_to_token_budget(
+    messages: list[Message], budget: int, model_name: str
+) -> list[Message]:
+    """Drop complete oldest exchanges while always retaining the current turn."""
     if budget == 0 or len(messages) <= 1:
-        return messages
+        return list(messages)
 
     from agno.utils.tokens import count_tokens as _agno_count_tokens
 
-    # Strip provider prefix so tiktoken gets a plain model id (e.g. "gpt-4o", "gemma-4-31b-it")
-    _model_id = FAST_MODEL.split(":", 1)[1] if ":" in FAST_MODEL else FAST_MODEL
+    model_id = model_name.split(":", 1)[1] if ":" in model_name else model_name
 
-    def _count(msgs: list[Message]) -> int:
-        return _agno_count_tokens(msgs, model_id=_model_id)
+    def count(msgs: list[Message]) -> int:
+        return _agno_count_tokens(msgs, model_id=model_id)
 
+    trimmed = list(messages)
     try:
-        count = _count(messages)
-    except Exception:
-        return messages  # counting unavailable — don't drop anything
-
-    if count <= budget:
-        return messages
-
-    # Proportional drop: remove roughly (1 - budget/count) fraction from the front,
-    # but always keep the last message (current user turn).
-    drop = max(1, int(len(messages) * (1 - budget / count)))
-    messages = messages[drop:]
-
-    # Single follow-up loop in case proportional estimate was off
-    try:
-        while len(messages) > 1 and _count(messages) > budget:
-            messages.pop(0)
-    except Exception:
-        pass
-
-    return messages
+        while len(trimmed) > 1 and count(trimmed) > budget:
+            while len(trimmed) > 1 and str(trimmed[0].role) != "user":
+                trimmed.pop(0)
+            next_user = next(
+                (
+                    index
+                    for index, message in enumerate(trimmed[1:], start=1)
+                    if str(message.role) == "user"
+                ),
+                None,
+            )
+            if next_user is None:
+                break
+            del trimmed[:next_user]
+        if len(trimmed) == 1 and count(trimmed) > budget:
+            print(
+                f"⚠️ [context] Current turn exceeds token budget {budget} for {model_name}"
+            )
+    except Exception as e:
+        print(f"⚠️ [context] Token counting failed for {model_name}: {e}")
+        return list(messages)
+    return trimmed
 
 
 def _select_agent(
@@ -899,7 +897,7 @@ async def call_discord_agent(step_input: StepInput) -> StepOutput:
         current_content = f"{current_content} {note}" if current_content else note
 
     user_content = f"{message_data['author_name']}: {current_content}"
-    messages_to_send = list(data["formatted_history"]) + [
+    canonical_messages = list(data["formatted_history"]) + [
         Message(role="user", content=user_content)
     ]
 
@@ -932,12 +930,12 @@ async def call_discord_agent(step_input: StepInput) -> StepOutput:
         print("🔀 [route] deep  ← URL in message, fast model lacks url_context")
         agent, model_name, context_budget = _deep, DEEP_MODEL, DEEP_CONTEXT_TOKEN_BUDGET
 
-    if context_budget:
-        before = len(messages_to_send)
-        messages_to_send = _trim_to_token_budget(messages_to_send, context_budget)
-        trimmed = before - len(messages_to_send)
-        if trimmed:
-            print(f"✂️ [call_discord_agent] Trimmed {trimmed} messages to fit token budget ({context_budget})")
+    messages_to_send = _trim_to_token_budget(
+        canonical_messages, context_budget, model_name
+    )
+    trimmed = len(canonical_messages) - len(messages_to_send)
+    if trimmed:
+        print(f"✂️ [call_discord_agent] Trimmed {trimmed} messages to fit token budget ({context_budget})")
 
     print(f"🤖 [call_discord_agent] Sending {len(messages_to_send)} messages to {model_name}")
 
@@ -975,8 +973,16 @@ async def call_discord_agent(step_input: StepInput) -> StepOutput:
                 fallback_agent, fallback_name = _fast, FAST_MODEL
 
             if fallback_agent is not None:
+                fallback_budget = (
+                    DEEP_CONTEXT_TOKEN_BUDGET
+                    if fallback_agent is _deep
+                    else FAST_CONTEXT_TOKEN_BUDGET
+                )
+                fallback_messages = _trim_to_token_budget(
+                    canonical_messages, fallback_budget, fallback_name
+                )
                 print(f"⚡ [call_discord_agent] {model_name} failed, falling back to {fallback_name}")
-                response = await _arun_agent(fallback_agent, messages_to_send, session_state)
+                response = await _arun_agent(fallback_agent, fallback_messages, session_state)
     finally:
         reset_request_context(_ctx_token)
 

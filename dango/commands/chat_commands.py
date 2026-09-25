@@ -2,6 +2,7 @@
 
 import asyncio
 import io
+from asyncio import Lock
 import json
 import os
 import time
@@ -106,6 +107,7 @@ def _build_message_data(message: discord.Message, bot_user_id: int) -> dict[str,
         "timestamp": datetime.now().isoformat(),
         "created_at": message.created_at.isoformat(),
         "is_dm": isinstance(message.channel, discord.DMChannel),
+        "is_thread": isinstance(message.channel, discord.Thread),
         "has_embeds": len(embeds) > 0,
         "message_type": str(message.type),
         "stickers": _sticker_dicts(message),
@@ -154,6 +156,11 @@ class ChatCog(commands.Cog):
         # active burst, owned by whoever opened it; a different speaker flushes it.
         # Only used when ENABLE_MESSAGE_BATCHING is on.
         self._bursts: dict[int, dict] = {}
+        self._workflow_locks: dict[tuple[int, int], Lock] = {}
+
+    def _workflow_lock(self, channel_id: int, author_id: int) -> Lock:
+        key = (int(channel_id), int(author_id))
+        return self._workflow_locks.setdefault(key, Lock())
 
     @commands.Cog.listener()
     async def on_message(self, message: discord.Message):
@@ -265,7 +272,13 @@ class ChatCog(commands.Cog):
         await self._run_workflow_for(burst["messages"])
 
     async def _run_workflow_for(self, messages: list[discord.Message]) -> None:
-        """Build merged message_data from a burst and run the workflow once."""
+        """Build merged message data and serialize this person's workflow."""
+        carrier = messages[0]
+        lock = self._workflow_lock(carrier.channel.id, carrier.author.id)
+        async with lock:
+            await self._run_workflow_locked(messages)
+
+    async def _run_workflow_locked(self, messages: list[discord.Message]) -> None:
         carrier = messages[0]
         async with carrier.channel.typing():
             try:
@@ -309,15 +322,91 @@ class ChatCog(commands.Cog):
     )
     async def newchat(self, interaction: discord.Interaction):
         try:
-            await interaction.response.send_message("[new chat] ---", ephemeral=False)
+            await interaction.response.defer(ephemeral=True)
+            channel = interaction.channel
+            author = interaction.user
+            reset_info = {
+                "version": 1,
+                "kind": "newchat",
+                "author_name": author.display_name,
+                "author_id": author.id,
+            }
+            async with self._workflow_lock(channel.id, author.id):
+                await channel.send(
+                    content="[new chat] ---",
+                    file=discord.File(
+                        io.BytesIO(json.dumps(reset_info, ensure_ascii=False).encode()),
+                        filename=f"dango_newchat_{author.id}.json",
+                    ),
+                )
+            await interaction.followup.send("✅", ephemeral=True)
             print(
-                f"✅ [newchat] New chat marker sent in {interaction.channel.name if hasattr(interaction.channel, 'name') else 'DM'}"
+                f"✅ [newchat] New chat marker sent in {channel.name if hasattr(channel, 'name') else 'DM'}"
             )
         except Exception as e:
             print(f"❌ [newchat] Error sending new chat marker: {e}")
-            await interaction.response.send_message(
-                "Failed to send new chat marker.", ephemeral=True
+            try:
+                await interaction.followup.send(
+                    "Failed to send new chat marker.", ephemeral=True
+                )
+            except Exception:
+                pass
+
+    async def _run_slash_workflow(
+        self,
+        interaction: discord.Interaction,
+        message: str,
+        marker: str,
+        filename: str,
+        metadata: dict,
+        workflow_flags: dict,
+    ) -> None:
+        channel = interaction.channel
+        author = interaction.user
+        async with self._workflow_lock(channel.id, author.id):
+            sent = await channel.send(
+                content=f"> **{marker}** **{author.display_name}:** {message}",
+                files=[
+                    discord.File(
+                        io.BytesIO(json.dumps(metadata, ensure_ascii=False).encode()),
+                        filename=filename,
+                    )
+                ],
             )
+
+            channel_name = channel.name if hasattr(channel, "name") else "DM"
+            guild_id = interaction.guild.id if interaction.guild else None
+            guild_name = interaction.guild.name if interaction.guild else ""
+            author_roles = (
+                [r.name for r in author.roles if r.name != "@everyone"]
+                if interaction.guild and isinstance(author, discord.Member)
+                else []
+            )
+            message_data = {
+                "content": message,
+                "embeds": [],
+                "author_id": author.id,
+                "author_name": author.display_name,
+                "author_roles": author_roles,
+                "channel_id": channel.id,
+                "channel_name": channel_name,
+                "message_id": sent.id,
+                "bot_user_id": self.bot.user.id,
+                "guild_id": guild_id,
+                "guild_name": guild_name,
+                "timestamp": datetime.now().isoformat(),
+                "created_at": sent.created_at.isoformat(),
+                "is_dm": isinstance(channel, discord.DMChannel),
+                "is_thread": isinstance(channel, discord.Thread),
+                "has_embeds": False,
+                "message_type": "default",
+                "_bot": self.bot,
+                "_chat_sys_prompt": self.chat_system_prompt,
+                "_history_limit": self.runtime_config.history_limit,
+                "_timezone": self.runtime_config.timezone,
+                **workflow_flags,
+            }
+            await self.discord_workflow.arun(input=message_data)
 
     @app_commands.command(
         name="deep",
@@ -343,56 +432,20 @@ class ChatCog(commands.Cog):
             author = interaction.user
 
             deep_info = {
+                "version": 1,
+                "kind": "deep",
                 "author_name": author.display_name,
                 "author_id": author.id,
                 "content": message,
             }
-            files = [
-                discord.File(
-                    io.BytesIO(json.dumps(deep_info, ensure_ascii=False).encode()),
-                    filename=f"dango_deep_{author.id}.json",
-                )
-            ]
-
-            sent = await channel.send(
-                content=f"> **[deep]** **{author.display_name}:** {message}",
-                files=files,
+            await self._run_slash_workflow(
+                interaction=interaction,
+                message=message,
+                marker="[deep]",
+                filename=f"dango_deep_{author.id}.json",
+                metadata=deep_info,
+                workflow_flags={"_force_deep": True},
             )
-
-            channel_name = channel.name if hasattr(channel, "name") else "DM"
-            guild_id = interaction.guild.id if interaction.guild else None
-            guild_name = interaction.guild.name if interaction.guild else ""
-            author_roles = (
-                [r.name for r in author.roles if r.name != "@everyone"]
-                if interaction.guild and isinstance(author, discord.Member)
-                else []
-            )
-
-            message_data = {
-                "content": message,
-                "embeds": [],
-                "author_id": author.id,
-                "author_name": author.display_name,
-                "author_roles": author_roles,
-                "channel_id": channel.id,
-                "channel_name": channel_name,
-                "message_id": sent.id,
-                "bot_user_id": self.bot.user.id,
-                "guild_id": guild_id,
-                "guild_name": guild_name,
-                "timestamp": datetime.now().isoformat(),
-                "created_at": sent.created_at.isoformat(),
-                "is_dm": isinstance(channel, discord.DMChannel),
-                "has_embeds": False,
-                "message_type": "default",
-                "_bot": self.bot,
-                "_chat_sys_prompt": self.chat_system_prompt,
-                "_history_limit": self.runtime_config.history_limit,
-                "_timezone": self.runtime_config.timezone,
-                "_force_deep": True,
-            }
-
-            await self.discord_workflow.arun(input=message_data)
             await interaction.followup.send("✅", ephemeral=True)
             print(f"✅ [deep] Processed request from {author.display_name}")
 
@@ -442,56 +495,20 @@ class ChatCog(commands.Cog):
             author = interaction.user
 
             skill_info = {
+                "version": 1,
+                "kind": "skill",
                 "author_name": author.display_name,
                 "author_id": author.id,
                 "content": message,
             }
-            files = [
-                discord.File(
-                    io.BytesIO(json.dumps(skill_info, ensure_ascii=False).encode()),
-                    filename=f"dango_skill_{author.id}.json",
-                )
-            ]
-
-            sent = await channel.send(
-                content=f"> **[skill: {name}]** **{author.display_name}:** {message}",
-                files=files,
+            await self._run_slash_workflow(
+                interaction=interaction,
+                message=message,
+                marker=f"[skill: {name}]",
+                filename=f"dango_skill_{author.id}.json",
+                metadata=skill_info,
+                workflow_flags={"_force_skill": name},
             )
-
-            channel_name = channel.name if hasattr(channel, "name") else "DM"
-            guild_id = interaction.guild.id if interaction.guild else None
-            guild_name = interaction.guild.name if interaction.guild else ""
-            author_roles = (
-                [r.name for r in author.roles if r.name != "@everyone"]
-                if interaction.guild and isinstance(author, discord.Member)
-                else []
-            )
-
-            message_data = {
-                "content": message,
-                "embeds": [],
-                "author_id": author.id,
-                "author_name": author.display_name,
-                "author_roles": author_roles,
-                "channel_id": channel.id,
-                "channel_name": channel_name,
-                "message_id": sent.id,
-                "bot_user_id": self.bot.user.id,
-                "guild_id": guild_id,
-                "guild_name": guild_name,
-                "timestamp": datetime.now().isoformat(),
-                "created_at": sent.created_at.isoformat(),
-                "is_dm": isinstance(channel, discord.DMChannel),
-                "has_embeds": False,
-                "message_type": "default",
-                "_bot": self.bot,
-                "_chat_sys_prompt": self.chat_system_prompt,
-                "_history_limit": self.runtime_config.history_limit,
-                "_timezone": self.runtime_config.timezone,
-                "_force_skill": name,
-            }
-
-            await self.discord_workflow.arun(input=message_data)
             await interaction.followup.send("✅", ephemeral=True)
             print(f"✅ [skill] Processed '{name}' request from {author.display_name}")
 
