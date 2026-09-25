@@ -67,8 +67,8 @@ class TestMergeBurstMessages:
             _fake_message("again", stickers=[_fake_sticker("party", "apng")]),
         ]
         data = _merge_burst_messages(msgs, bot_user_id=999)
-        names = [s["name"] for s in data["stickers"]]
-        assert names == ["wave", "party"]
+        assert data["stickers"] == [{"name": "wave"}, {"name": "party"}]
+        assert "attachments" not in data
 
 
 # ── Debounce behaviour, proven against a virtual clock (no Discord, no wall time) ──

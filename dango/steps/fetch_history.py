@@ -8,7 +8,6 @@ import re
 
 import aiohttp
 import discord
-from agno.media import Image
 from agno.models.message import Message
 from agno.workflow import StepInput, StepOutput
 
@@ -76,12 +75,10 @@ async def fetch_and_process_history(step_input: StepInput) -> StepOutput:
 
         table_content_map = await _extract_table_attachments(msgs)
         deep_map = await _extract_deep_attachments(msgs)
-        image_map = await _download_image_attachments(msgs, bot_user_id)
-        sticker_map = await _download_sticker_map(msgs, bot_user_id)
         reply_map, extra_msgs = await _build_reply_map(msgs, channel, bot_user_id)
         mention_map = await _build_mention_map(msgs + extra_msgs)
         formatted_history, unique_users = _process_messages(
-            msgs, bot_user_id, table_content_map, image_map, deep_map, mention_map, reply_map, sticker_map
+            msgs, bot_user_id, table_content_map, deep_map, mention_map, reply_map
         )
 
         return StepOutput(
@@ -132,11 +129,9 @@ async def _extract_table_attachments(msgs: list) -> dict:
 async def _extract_deep_attachments(msgs: list) -> dict:
     """Download dango_deep_*.json / dango_skill_*.json attachments → {message_id: info}.
 
-    info contains: author_name, author_id, content, and optionally
-    _images (list[Image]) when an image was re-uploaded alongside the JSON.
-    Used by _process_messages to restore /deep and /skill slash command
-    messages as proper user turns in conversation history (both post the
-    message as the bot, so without this they'd be misread as bot replies).
+    Used by _process_messages to restore slash command messages as proper user
+    turns in conversation history (both post the message as the bot, so without
+    this they'd be misread as bot replies).
     """
     deep_map: dict[int, dict] = {}
     async with aiohttp.ClientSession() as session:
@@ -145,8 +140,6 @@ async def _extract_deep_attachments(msgs: list) -> dict:
                 continue
 
             deep_info = None
-            image_attachments = []
-
             for attachment in msg.attachments:
                 if attachment.filename.startswith(("dango_deep_", "dango_skill_")) and attachment.filename.endswith(".json"):
                     try:
@@ -157,92 +150,11 @@ async def _extract_deep_attachments(msgs: list) -> dict:
                         print(
                             f"❌ [fetch_and_process_history] Failed to download deep attachment: {e}"
                         )
-                elif attachment.content_type and attachment.content_type.startswith("image/"):
-                    image_attachments.append(attachment)
 
             if deep_info is not None:
-                images: list[Image] = []
-                for img_att in image_attachments:
-                    try:
-                        async with session.get(img_att.url) as resp:
-                            if resp.status == 200:
-                                images.append(Image(content=await resp.read(), mime_type=img_att.content_type))
-                    except Exception as e:
-                        print(
-                            f"❌ [fetch_and_process_history] Failed to download deep image: {e}"
-                        )
-                deep_info["_images"] = images
                 deep_map[msg.id] = deep_info
 
     return deep_map
-
-
-async def _download_image_attachments(msgs: list, bot_user_id: int) -> dict:
-    """Download image attachments from user messages; returns dict[message_id -> list[Image]]."""
-    image_map: dict[int, list[Image]] = {}
-    async with aiohttp.ClientSession() as session:
-        for msg in msgs:
-            if msg.author.id == bot_user_id or not msg.attachments:
-                continue
-            images: list[Image] = []
-            for attachment in msg.attachments:
-                if "dango_replaced" in attachment.filename:
-                    continue
-                content_type = attachment.content_type or ""
-                if not content_type.startswith("image/"):
-                    continue
-                try:
-                    async with session.get(attachment.url) as resp:
-                        if resp.status == 200:
-                            data = await resp.read()
-                            images.append(Image(content=data, mime_type=content_type))
-                except Exception as e:
-                    print(f"❌ [fetch_and_process_history] Failed to download image: {e}")
-            if images:
-                image_map[msg.id] = images
-    return image_map
-
-
-# Sticker format → image mime type. Lottie (Discord's default packs) is vector
-# JSON, not viewable by vision models, so it is intentionally absent here.
-_STICKER_IMAGE_MIME = {
-    "png":  "image/png",
-    "apng": "image/png",
-    "gif":  "image/gif",
-}
-
-
-async def _download_sticker_map(msgs: list, bot_user_id: int) -> dict:
-    """Download community sticker images from user messages.
-
-    Returns dict[message_id -> {"images": list[Image], "names": list[str]}].
-    Image-format stickers (PNG/APNG/GIF) are downloaded so the model can see
-    them; every sticker's name is kept so Lottie stickers still reach the model
-    as text.
-    """
-    sticker_map: dict[int, dict] = {}
-    async with aiohttp.ClientSession() as session:
-        for msg in msgs:
-            if msg.author.id == bot_user_id or not msg.stickers:
-                continue
-            images: list[Image] = []
-            names: list[str] = []
-            for sticker in msg.stickers:
-                if sticker.name:
-                    names.append(sticker.name)
-                fmt = sticker.format.name.lower() if sticker.format else ""
-                mime = _STICKER_IMAGE_MIME.get(fmt)
-                if not mime:
-                    continue
-                try:
-                    async with session.get(str(sticker.url)) as resp:
-                        if resp.status == 200:
-                            images.append(Image(content=await resp.read(), mime_type=mime))
-                except Exception as e:
-                    print(f"❌ [fetch_and_process_history] Failed to download sticker: {e}")
-            if images or names:
-                sticker_map[msg.id] = {"images": images, "names": names}
-    return sticker_map
 
 
 async def _build_mention_map(msgs: list) -> dict[str, str]:
@@ -340,17 +252,14 @@ def _process_messages(
     msgs: list,
     bot_user_id: int,
     table_content_map: dict,
-    image_map: dict,
     deep_map: dict | None = None,
     mention_map: dict | None = None,
     reply_map: dict | None = None,
-    sticker_map: dict | None = None,
 ) -> tuple[list[Message], set[str]]:
-    """Normalize Discord messages and convert to Agno Message list."""
+    """Normalize Discord messages and convert to text-only Agno Messages."""
     deep_map = deep_map or {}
     mention_map = mention_map or {}
     reply_map = reply_map or {}
-    sticker_map = sticker_map or {}
     raw_messages = []
     unique_users: set[str] = set()
 
@@ -365,7 +274,6 @@ def _process_messages(
                 "content": resolve_mentions(info.get("content", ""), mention_map),
                 "author_id": info.get("author_id"),
                 "author_name": author_name,
-                "images": info.get("_images", []),
             })
         elif msg.author.id == bot_user_id:
             content = resolve_mentions(msg.content.strip(), mention_map)
@@ -387,20 +295,16 @@ def _process_messages(
                     ref_content=ref_content,
                     current_content=content,
                 )
-            images = list(image_map.get(msg.id, []))
-            sticker_info = sticker_map.get(msg.id)
-            if sticker_info:
-                if sticker_info["names"]:
-                    note = f"[sticker: {', '.join(sticker_info['names'])}]"
-                    content = f"{content} {note}" if content else note
-                images.extend(sticker_info["images"])
+            sticker_names = [sticker.name for sticker in msg.stickers if sticker.name]
+            if sticker_names:
+                note = f"[sticker: {', '.join(sticker_names)}]"
+                content = f"{content} {note}" if content else note
             raw_messages.append(
                 {
                     "role": "user",
                     "content": content,
                     "author_id": msg.author.id,
                     "author_name": author_name,
-                    "images": images,
                 }
             )
 
@@ -419,23 +323,21 @@ def _process_messages(
             i = j
         else:
             combined = [f"{current['author_name']}: {current['content']}"]
-            combined_images = list(current.get("images", []))
             j = i + 1
             while j < len(raw_messages) and raw_messages[j]["role"] == "user":
                 if raw_messages[j]["author_id"] == current["author_id"]:
                     combined.append(raw_messages[j]["content"])
-                    combined_images.extend(raw_messages[j].get("images", []))
                 else:
                     break
                 j += 1
-            entry = {"role": "user", "content": "\n".join(combined), "images": combined_images}
+            entry = {"role": "user", "content": "\n".join(combined)}
             if (
                 j < len(raw_messages)
                 and raw_messages[j]["role"] == "user"
                 and raw_messages[j]["author_id"] != current["author_id"]
             ):
                 normalized.append(entry)
-                normalized.append({"role": "assistant", "content": "...", "images": []})
+                normalized.append({"role": "assistant", "content": "..."})
                 i = j
             else:
                 normalized.append(entry)
@@ -453,7 +355,7 @@ def _process_messages(
         normalized.pop(0)
 
     formatted_history = [
-        Message(role=m["role"], content=m["content"], images=m.get("images") or None)
+        Message(role=m["role"], content=m["content"])
         for m in normalized
     ]
     print(

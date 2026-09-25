@@ -8,7 +8,6 @@ import time
 from datetime import datetime
 from typing import Any
 
-import aiohttp
 import discord
 from discord import app_commands
 from discord.ext import commands
@@ -53,30 +52,8 @@ def _embed_dicts(message: discord.Message) -> list[dict]:
     return embeds
 
 
-def _attachment_dicts(message: discord.Message) -> list[dict]:
-    return [
-        {
-            "filename": str(a.filename),
-            "url": str(a.url),
-            "size": int(a.size),
-            "content_type": str(a.content_type) if a.content_type else "",
-        }
-        for a in message.attachments
-    ] if message.attachments else []
-
-
 def _sticker_dicts(message: discord.Message) -> list[dict]:
-    # Stickers are separate from attachments in Discord. Community stickers
-    # are PNG/APNG/GIF (viewable); Discord's default packs are Lottie (vector
-    # JSON, name only). call_agent downloads the image formats for the model.
-    return [
-        {
-            "name": str(s.name),
-            "url": str(s.url),
-            "format": s.format.name if s.format else "",
-        }
-        for s in message.stickers
-    ] if message.stickers else []
+    return [{"name": str(s.name)} for s in message.stickers] if message.stickers else []
 
 
 def _build_message_data(message: discord.Message, bot_user_id: int) -> dict[str, Any]:
@@ -131,7 +108,6 @@ def _build_message_data(message: discord.Message, bot_user_id: int) -> dict[str,
         "is_dm": isinstance(message.channel, discord.DMChannel),
         "has_embeds": len(embeds) > 0,
         "message_type": str(message.type),
-        "attachments": _attachment_dicts(message),
         "stickers": _sticker_dicts(message),
     }
 
@@ -144,7 +120,7 @@ def _merge_burst_messages(
 
     The first message is the carrier — its id/timestamp/reply anchor are used so
     fetch_history reads the channel *before* the whole burst (no duplication).
-    Later messages contribute their text, attachments and stickers.
+    Later messages contribute their text and sticker names.
     """
     data = _build_message_data(messages[0], bot_user_id)
     if len(messages) == 1:
@@ -155,7 +131,6 @@ def _merge_burst_messages(
         extra = str(m.clean_content) if m.clean_content else ""
         if extra:
             contents.append(extra)
-        data["attachments"].extend(_attachment_dicts(m))
         data["stickers"].extend(_sticker_dicts(m))
         data["embeds"].extend(_embed_dicts(m))
     data["content"] = "\n".join(contents)
@@ -348,15 +323,11 @@ class ChatCog(commands.Cog):
         name="deep",
         description="Send a message and force the deep model to respond",
     )
-    @app_commands.describe(
-        message="Your message for the deep model",
-        image="Optional image attachment",
-    )
+    @app_commands.describe(message="Your message for the deep model")
     async def deep_command(
         self,
         interaction: discord.Interaction,
         message: str,
-        image: discord.Attachment = None,
     ):
         try:
             if _call_agent_step.deep_agent is None:
@@ -382,20 +353,6 @@ class ChatCog(commands.Cog):
                     filename=f"dango_deep_{author.id}.json",
                 )
             ]
-
-            if image and image.content_type and image.content_type.startswith("image/"):
-                try:
-                    async with aiohttp.ClientSession() as session:
-                        async with session.get(image.url) as resp:
-                            if resp.status == 200:
-                                files.append(
-                                    discord.File(
-                                        io.BytesIO(await resp.read()),
-                                        filename=image.filename,
-                                    )
-                                )
-                except Exception as e:
-                    print(f"⚠️ [deep] Failed to re-upload image: {e}")
 
             sent = await channel.send(
                 content=f"> **[deep]** **{author.display_name}:** {message}",
@@ -428,14 +385,6 @@ class ChatCog(commands.Cog):
                 "is_dm": isinstance(channel, discord.DMChannel),
                 "has_embeds": False,
                 "message_type": "default",
-                "attachments": [
-                    {
-                        "filename": image.filename,
-                        "url": image.url,
-                        "size": image.size,
-                        "content_type": image.content_type or "",
-                    }
-                ] if image and image.content_type and image.content_type.startswith("image/") else [],
                 "_bot": self.bot,
                 "_chat_sys_prompt": self.chat_system_prompt,
                 "_history_limit": self.runtime_config.history_limit,
@@ -463,14 +412,12 @@ class ChatCog(commands.Cog):
     @app_commands.describe(
         name="The skill to apply",
         message="Your message",
-        image="Optional image attachment",
     )
     async def skill_command(
         self,
         interaction: discord.Interaction,
         name: str,
         message: str,
-        image: discord.Attachment = None,
     ):
         try:
             available = _call_agent_step.list_skill_names()
@@ -506,20 +453,6 @@ class ChatCog(commands.Cog):
                 )
             ]
 
-            if image and image.content_type and image.content_type.startswith("image/"):
-                try:
-                    async with aiohttp.ClientSession() as session:
-                        async with session.get(image.url) as resp:
-                            if resp.status == 200:
-                                files.append(
-                                    discord.File(
-                                        io.BytesIO(await resp.read()),
-                                        filename=image.filename,
-                                    )
-                                )
-                except Exception as e:
-                    print(f"⚠️ [skill] Failed to re-upload image: {e}")
-
             sent = await channel.send(
                 content=f"> **[skill: {name}]** **{author.display_name}:** {message}",
                 files=files,
@@ -551,14 +484,6 @@ class ChatCog(commands.Cog):
                 "is_dm": isinstance(channel, discord.DMChannel),
                 "has_embeds": False,
                 "message_type": "default",
-                "attachments": [
-                    {
-                        "filename": image.filename,
-                        "url": image.url,
-                        "size": image.size,
-                        "content_type": image.content_type or "",
-                    }
-                ] if image and image.content_type and image.content_type.startswith("image/") else [],
                 "_bot": self.bot,
                 "_chat_sys_prompt": self.chat_system_prompt,
                 "_history_limit": self.runtime_config.history_limit,

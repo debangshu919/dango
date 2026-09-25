@@ -35,6 +35,75 @@ class TestCallDiscordAgent:
         assert asyncio.iscoroutinefunction(call_discord_agent)
 
 
+class TestTextOnlyModelInput:
+    def test_current_turn_does_not_include_image_payloads(self, monkeypatch):
+        from types import SimpleNamespace
+
+        import dango.steps.call_agent as call_agent
+        from agno.run.base import RunStatus
+
+        captured = {}
+        agent = SimpleNamespace(model=None)
+
+        async def capture_run(_agent, messages, _session_state):
+            captured["messages"] = messages
+            return SimpleNamespace(status=RunStatus.completed, content="reply")
+
+        monkeypatch.setattr(call_agent, "_initialize_agents", lambda: None)
+        monkeypatch.setattr(call_agent, "fast_agent", agent)
+        monkeypatch.setattr(call_agent, "deep_agent", None)
+        monkeypatch.setattr(
+            call_agent,
+            "_select_agent",
+            lambda *args, **kwargs: (agent, "text-model", 0),
+        )
+        monkeypatch.setattr(call_agent, "_arun_agent", capture_run)
+
+        message_data = {
+            "author_name": "Alice",
+            "author_id": 1,
+            "content": "What is this?",
+            "attachments": [{"url": "https://cdn.example/image.png", "content_type": "image/png"}],
+            "stickers": [{"name": "wave", "url": "https://cdn.example/sticker.png"}],
+            "_chat_sys_prompt": "system",
+        }
+        result = __import__("asyncio").run(
+            call_agent.call_discord_agent(
+                SimpleNamespace(
+                    previous_step_content={
+                        "message_data": message_data,
+                        "formatted_history": [],
+                    }
+                )
+            )
+        )
+
+        current_message = captured["messages"][-1]
+        assert current_message.content == "Alice: What is this? [sticker: wave]"
+        assert getattr(current_message, "images", None) is None
+        assert "image.png" not in current_message.content
+        assert result.content["llm_response"] == "reply"
+
+    def test_history_messages_are_text_only(self):
+        from types import SimpleNamespace
+
+        from dango.steps.fetch_history import _process_messages
+
+        sticker = SimpleNamespace(name="wave", url="https://cdn.example/sticker.png")
+        message = SimpleNamespace(
+            id=1,
+            author=SimpleNamespace(id=123, display_name="Alice"),
+            content="hello",
+            stickers=[sticker],
+            attachments=[SimpleNamespace(url="https://cdn.example/image.png")],
+        )
+        history, _ = _process_messages([message], 999, {})
+
+        assert history[0].content == "Alice: hello [sticker: wave]"
+        assert getattr(history[0], "images", None) is None
+        assert "cdn.example" not in history[0].content
+
+
 class TestGenshinWiki:
     def test_wiki_url_uses_api_reader(self, monkeypatch):
         import json
