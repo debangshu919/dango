@@ -239,6 +239,41 @@ class TestConversationLocks:
 
 
 class TestContextTrimming:
+    def test_limits_model_input_to_three_latest_user_messages(self):
+        from dango.steps.call_agent import _limit_user_messages
+
+        messages = [
+            Message(role="user", content="old question"),
+            Message(role="assistant", content="old answer"),
+            Message(role="user", content="middle question"),
+            Message(role="assistant", content="middle answer"),
+            Message(role="user", content="recent question"),
+            Message(role="assistant", content="recent answer"),
+            Message(role="user", content="current"),
+        ]
+
+        limited = _limit_user_messages(messages, 3)
+
+        assert [message.content for message in limited] == [
+            "middle question",
+            "middle answer",
+            "recent question",
+            "recent answer",
+            "current",
+        ]
+        assert sum(message.role == "user" for message in limited) == 3
+
+    def test_keeps_all_messages_when_within_user_message_limit(self):
+        from dango.steps.call_agent import _limit_user_messages
+
+        messages = [
+            Message(role="user", content="previous question"),
+            Message(role="assistant", content="previous answer"),
+            Message(role="user", content="current"),
+        ]
+
+        assert _limit_user_messages(messages, 3) == messages
+
     def test_drops_complete_exchange_with_selected_model(self, monkeypatch):
         from dango.steps.call_agent import _trim_to_token_budget
 

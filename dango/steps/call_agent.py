@@ -847,6 +847,16 @@ def _trim_to_token_budget(
     return trimmed
 
 
+def _limit_user_messages(messages: list[Message], limit: int) -> list[Message]:
+    user_indices = [
+        index for index, message in enumerate(messages)
+        if str(message.role) == "user"
+    ]
+    if len(user_indices) <= limit:
+        return list(messages)
+    return list(messages[user_indices[-limit]:])
+
+
 def _select_agent(
     user_content: str,
     history: list[str] | None = None,
@@ -897,9 +907,12 @@ async def call_discord_agent(step_input: StepInput) -> StepOutput:
         current_content = f"{current_content} {note}" if current_content else note
 
     user_content = f"{message_data['author_name']}: {current_content}"
-    canonical_messages = list(data["formatted_history"]) + [
-        Message(role="user", content=user_content)
-    ]
+    canonical_messages = _limit_user_messages(
+        list(data["formatted_history"]) + [
+            Message(role="user", content=user_content)
+        ],
+        3,
+    )
 
     if message_data.get("_force_deep") and _deep and DEEP_MODEL:
         print(f"🔀 [route] deep  ← forced via !! prefix")
